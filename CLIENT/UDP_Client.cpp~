@@ -1,0 +1,360 @@
+/*
+Author: Sikai Zhao
+Class: ECE 6122
+Last date modified: 10/22/19
+Description: Client for UDP, using two thread to handle command and message, supporting four 3 kinds of command types, namely 'v', 't' and 'q'.
+*/
+
+#include <iostream>
+#include <string.h> //String operations
+#include <stdio.h>
+#include <stdlib.h>
+#include <thread>   //Thread operations
+#include <mutex>
+#include <map>      //Map structure
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netdb.h>  /* Needed for getaddrinfo() and freeaddrinfo() */
+#include <unistd.h> /* Needed for close() */
+#include <errno.h>  //To output the error code of sendto and recvfrom
+
+using namespace std;
+
+typedef int SOCKET;
+struct udpMessage       //Define the udpMessage structure
+{
+    unsigned char nVersion;
+    unsigned char nType;
+    unsigned short nMsgLen;
+    unsigned long lSeqNum;
+    char chMsg[1000];
+};
+
+//Global variables
+int sockfd;             //Socket descriptor
+int version;            //Store the client version
+int messageMax=1000;    //Maximum of the message length
+bool shutDown = false;  //Bool to shut down the client
+struct sockaddr_in serv_addr;   //Server address
+
+//Functions
+int sockInit(void);     //Initiate the socket
+int sockQuit(void);     //Quit the socket
+int sockClose(SOCKET sock);     //Close the socket
+void error(const char *msg);    //Error detection
+void startClient(int portno, const char *server_address);    //Start the client
+void messageReceiving();    //Receive the message
+void messageHandling(udpMessage message);    //Handle the message
+void commandInput();    //Input the command and do corresponding task
+void messageSending(udpMessage buffer);    //Send message
+
+/*
+* Function name: Main
+* Summary: Take in commandline arguments and detect error. Define socket related variables such as portno and start the Client. Then spawn threads to do tasks of receiving message and inputting command.
+* Parameter:
+* 1. argc: number of input commandline arguments
+* 2. *argv[]: array of input commandline arguments
+* Return: N/A
+*/
+
+int main(int argc, char*argv[])
+{
+    if (argc < 3)   //Error if arguments less than 3
+    {
+        fprintf(stderr, "ERROR, no port provided\n");
+        exit(1);
+    }
+    
+    int sockfd, newsockfd, portno;
+    portno = atoi(argv[2]);     //Get port number
+    startClient(portno,argv[1]);//Start the client
+    
+    //Spawn two threads to handle message receiving and command inputting
+    std::thread threadReceiving(messageReceiving);
+    std::thread threadCommand(commandInput);
+
+    //Wait until threads finish when shutted down
+    threadReceiving.join();
+    threadCommand.join();
+    
+    // Quit and close the socket
+    sockQuit();
+    sockClose(sockfd);
+}
+/*
+* Function name: sockInit
+* Summary: Initiate the socket
+* Parameter: N/A
+* Return: N/A
+*/
+int sockInit(void)
+{
+    #ifdef _WIN32
+    WSADATA wsa_data;
+        return WSAStartup(MAKEWORD(1, 1), &wsa_data);
+    #else
+        return 0;
+    #endif
+}
+/*
+* Function name: sockQuit
+* Summary: Cross-platform socket quit
+* Parameter: N/A
+* Return: N/A
+*/
+int sockQuit(void)
+{
+    #ifdef _WIN32
+        return WSACleanup();
+    #else
+        return 0;
+    #endif
+}
+/*
+* Function name: sockClose
+* Summary: Cross-platform socket close
+* Parameter: N/A
+* Return: N/A
+*/
+int sockClose(SOCKET sock)
+{
+    int status = 0;
+    #ifdef _WIN32
+        status = shutdown(sock, SD_BOTH);
+        if (status == 0) 
+        {
+            status = closesocket(sock); 
+        }
+    #else
+        status = shutdown(sock, SHUT_RDWR);
+        if (status == 0) 
+        { 
+            status = close(sock);
+        }
+    #endif
+        return status;
+}
+/*
+* Function name: error
+* Summary: Output error message and exit
+* Parameter: const char *msg
+* Return: N/A
+*/
+void error(const char *msg)
+{
+    perror(msg);
+    exit(1);
+}
+/*
+* Function name: startClient
+* Summary: Start the client using the commandline input server address and port number;
+* Parameter:
+ 1. int portno: port number used
+ 2. const char *server_address: the address of server, we use "localhost".
+* Return: N/A
+*/
+void startClient(int portno, const char *server_address)
+{
+    //struct sockaddr_in serv_addr;
+    struct hostent *server;
+    sockInit();// Create the socket
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    //Check if the socket was created
+    if (sockfd < 0)
+        error("ERROR opening socket");
+    //Get the server
+    server = gethostbyname(server_address);
+    // Check if the server was got
+    if (server == NULL)
+    {
+        fprintf(stderr, "ERROR, no such host\n");
+        exit(0);
+    }
+    
+    // Zero out serv_addr variable
+    memset((char *)&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    memmove((char *)&serv_addr.sin_addr.s_addr, (char *)server->h_addr, server->h_length);
+    serv_addr.sin_port = htons(portno);
+}
+/*
+* Function name: messageReceiving
+* Summary: Receiving the message from the server
+* Parameter: N/A
+* Return: N/A
+*/
+void messageReceiving()
+{
+    while(!shutDown)
+    {
+        int n;
+        socklen_t fromlen = 0;
+        struct sockaddr from;
+        memset((char *)&from, 0, sizeof(sockaddr));
+        udpMessage receive;    //Define udpmessage to store received message
+
+        fromlen = sizeof(serv_addr);
+        n = recvfrom(sockfd, &receive, sizeof(receive), 0, (sockaddr *)&from, &fromlen);//Receive message from the server
+        //If error occurs, print the error
+        if (n < 0)
+        {
+            error("ERROR reading from socket");
+        }
+        else    //Else handle the message received
+        {
+            if(n > 0)
+            {
+                messageHandling(receive);
+            }
+        }
+    }
+}
+/*
+* Function name: messageHandling
+* Summary: Handling the message that received from server
+* Parameter: udpMessage message
+* Return: N/A
+*/
+void messageHandling(udpMessage message)
+{
+    //Convert variables in udpMessage struct from network to host
+    message.nMsgLen = ntohs(message.nMsgLen);
+    message.lSeqNum = ntohl(message.lSeqNum);
+    // Print the message in the required format
+    cout<<"Received Msg Type: "<<"1"<<", Seq: "<<message.lSeqNum<<", Msg: "<<message.chMsg<<endl;
+    cout<<"Please enter a command"<<endl;
+}
+/*
+* Function name: commandInput
+* Summary:
+    1. Prompt the user for command
+    2. Do the stuff according to the user's input command
+* Parameter: N/A
+* Return: N/A
+*/
+void commandInput()
+{
+    char command[messageMax];//Define a char array to store the command
+    //Prompt fot input command while client not shutted
+    while(!shutDown)
+    {
+        //cin.clear();
+        cout << "Please enter a command: " << std::endl;
+        fgets(command, 1023, stdin);// Get the input command
+        if (command==NULL)
+            continue;
+	 //Create a udpMessage struct for sending
+
+        udpMessage message;
+        //Split the first part of the command
+        char *token = strtok(command, " ");
+        //Use the first character of the first part to set the command type.
+        switch (token[0])
+        {
+            case 'v'://If the command is 'v'
+            {
+                //Split the second part of command
+                char *token2_v=strtok(NULL, " ");
+		if(token2_v==NULL)
+		{
+		    cout<<"Please input the version of the message"<<endl;
+		    break;
+		}
+                int ver = atoi(token2_v);//Convert to int
+                if(ver < 0)//If less than 0, error
+                {
+                    cout << "Error: Version must be larger than or equal to 0" << endl;
+                    break;
+                }
+                version = ver;//Set the version of the client
+                cout << "Version: " << version << endl;
+                break;
+            }
+            case 't'://If the command is 't'
+            {
+                //Split the second part of the command
+                char *token2_t=strtok(NULL, " ");
+		if(*token2_t<'0'||*token2_t>'9')
+		{
+		    cout<<"Invalid. The type number must be a number"<<endl;
+		    break;
+		}
+		if(token2_t==NULL)//Check if it's null
+                {
+                    cout<<"Please input the lSeqNum of the message"<<endl;
+                    break;
+                }
+
+                int type = atoi(token2_t);//Conver to int
+                //Set the nType of the udpMessage
+                message.nType = type;
+                
+                //Split the third part of the command
+                char *token3=strtok(NULL," ");
+		if(*token3<'0'||*token3>'9')
+		{
+		    cout<<"Invalid. The sequence number must be a number"<<endl;
+		    break;
+		}
+                if(token3==NULL)//Check if it's null
+                {
+                    cout<<"Please input the lSeqNum of the message"<<endl;
+                    break;
+                }
+                int seq = atoi(token3);//Conver to int
+                //Set the lSeqNum of the udpMessage
+                message.lSeqNum=seq;
+		
+                //Split the forth part of the command
+                char *token4 = strtok(NULL,"\n");
+                if(token4==NULL)//Check if it's null
+                {
+                    cout<<"Please input the chMsg of the message"<<endl;
+                    break;
+                }
+                
+                //Check if the length of the message is larger than maximum and set the nMsgLen of the udpMessage
+                message.nMsgLen = strlen(token4)<=messageMax?strlen(token4):messageMax;
+                //Copy the needed length of message into the udpMessage
+                strncpy(message.chMsg,token4, message.nMsgLen);
+                //Conver the variables from host to network
+                message.nMsgLen = htons(message.nMsgLen);
+                message.lSeqNum = htonl(message.lSeqNum);
+              
+                messageSending(message);//Call the messageSending function
+                break;
+            }
+            case 'q'://If the command is 'q'
+            {
+                shutDown = true;    //Set the shutDown true to close
+                break;
+            }
+            default://If not the three kinds of command, output err message
+                cout << "Not a valid arguments, please choose from v, t and q" << endl;
+                break;
+        }
+    }
+    //If the shutDown is set true, the while loop is ended and shutdown the socket
+    shutdown(sockfd, SHUT_RDWR);
+}
+/*
+* Function name: messageSending
+* Summary: Sending the message to the server
+* Parameter: udpMessage buffer
+* Return: N/A
+*/
+void messageSending(udpMessage buffer)
+{
+    int n;
+    buffer.nVersion = version;//Set the version of command
+    //Send message to the server
+    n = sendto(sockfd, &buffer, sizeof(buffer), 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    //printf("%d\n",errno);//Print error code if necessary
+
+    if (n < 0)
+    {
+        error("ERROR writing to socket");//If error output err message
+    }
+}

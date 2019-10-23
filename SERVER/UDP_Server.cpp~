@@ -398,7 +398,7 @@ void compositeSending()
     
     udpMessage message{0};
     //Copy the message of length of sending to the udpMessage's chMsg
-    strncpy(message.chMsg, msgSending, msgSendLength-1);
+    strncpy(message.chMsg, msgSending, msgSendLength);
     //Convert values from host to network
     message.lSeqNum = htonl(compSeqNum);
     message.nMsgLen = htons(msgSendLength);
